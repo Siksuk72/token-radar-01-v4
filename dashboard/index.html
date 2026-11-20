@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<title>Token Radar — pre-token launch board</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <h1>📡 TOKEN <b>RADAR</b> — pre-token launch board</h1>
+  <div class="stats" id="stats"></div>
+</header>
+<div class="bar">
+  <input type="search" id="q" placeholder="Cari protocol / kategori / chain…" style="min-width:280px">
+  <span class="chip on" data-v="ALL">Semua</span>
+  <span class="chip" data-v="FARM" style="color:var(--farm)">FARM</span>
+  <span class="chip" data-v="THIN" style="color:var(--thin)">THIN</span>
+  <span class="chip" data-v="SKIP">SKIP</span>
+  <select id="cat"><option value="">Semua kategori</option></select>
+  <select id="chain"><option value="">Semua chain</option></select>
+  <span class="c" id="count"></span>
+</div>
+<table>
+  <thead><tr>
+    <th data-s="rank">#</th><th data-s="name">Protocol</th><th data-s="category">Kategori</th>
+    <th>Chains</th><th data-s="tvl">TVL</th><th data-s="change7d">7Δ</th>
+    <th data-s="implied">Implied value</th><th data-s="confidence">Conf</th><th data-s="verdict">Verdict</th>
+  </tr></thead>
+  <tbody id="tb"></tbody>
+</table>
+<aside id="detail"><span class="close" onclick="closeDetail()">✕</span><div id="dBody"></div></aside>
+<footer>Token Radar · dibuat untuk bounty token-radar-01 · data: snapshot segel ·
+model radar-v1 — tiap angka dijelaskan di detail view · offline total</footer>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
