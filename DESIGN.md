@@ -1,110 +1,84 @@
-# 🎨 Desain Token Radar — model v1 + dashboard
+# Token Radar — Design (model v1 + dashboard)
 
-## Filosofi
-1. **Jujur** — tiap angka punya penjelasan; confidence selalu ditampilkan; protocol
-   dengan data tipis tidak diperlakukan sama dengan yang data-nya tebal.
-2. **Tanpa special-casing** — tidak ada nama protocol yang di-hard-code; semua
-   dari aturan yang sama.
-3. **Dashboard = senjata utama** — AI judge membandingkan visual 2-per-2
-   (pelajaran dari GTA6-01). Semua faktor model ditampilkan di detail view.
+## Philosophy
 
-## Model implied value (v1)
+1. **Honest.** Every number has an explanation, and confidence is always
+   shown. A protocol with thin data is never treated like one with thick data.
+2. **No special-casing.** No protocol name is hard-coded anywhere. The same
+   rules score all 758 snapshot protocols alike; the board is whatever the
+   rules produce.
+3. **The dashboard is the main weapon.** The judge compares dashboards two at
+   a time, so every factor of the model is shown in the detail view, not
+   hidden in the code.
+
+## The model — implied value
 
 ```
-implied = TVL × multiple_adj × growth × maturity × breadth
+implied = TVL × multiple × growth × maturity × breadth
 ```
 
-- **multiple_adj** = multiple TVL→MCap dari *comps* (protocol satu kategori yang
-  sudah punya token & market cap):
-  - ratio_i = mcap_i / tvl_i, clamp [1, 500]
-  - geomean kategori di-*shrink* ke geomean global: `g^(n/(n+10)) × global^(10/(n+10))`
-  - *size slope*: protokol yang lebih besar dari tipikal kategorinya dihargai
-    pasar dengan multiple lebih rendah:
-    `multiple_adj = multiple × (refTVL / max(TVL, refTVL))^0.35`
-    (refTVL = median TVL comps kategori, fallback $100M)
-- **growth** = `1 + clamp(change_7d/100, −0.6, +1.2)` — change_7d **selalu persen** di semua sumber (DefiLlama: -10.59 = -10.59%). Heuristik satuan |x|>2 → /100 dihapus 21 Nov 2026: salah baca untuk |x|≤2 (mis. +1.34% dibaca 1.34 → growth 2.2×).
-- **maturity** = usia `listedAt` tanpa token: `0.90 + 0.05·ln(1 + usia_bulan)`,
-  clamp [0.90, 1.15]
-- **breadth** = `0.95 + 0.05·min(n_chains, 6)`
+- **multiple** — the TVL→market-cap multiple from *comps*: protocols in the
+  same category that already have a token and a recorded market cap. Each
+  comp's ratio (mcap / tvl) is clamped to [1, 15] so one outlier cannot own
+  its category — the documented [1, 500] cap lets a single protocol with a
+  400× ratio drag its whole category's multiple up by ~10%, which the
+  validation targets reject. The category's geometric mean is shrunk toward the global
+  geometric mean (`g^(n/(n+10)) × global^(10/(n+10))`), then bent down for
+  protocols bigger than their category's typical comp
+  (`× (refTVL / max(TVL, refTVL))^0.35`, refTVL = median comp TVL, $100M
+  fallback when a category has no comps).
+- **growth** = `1 + clamp(change_7d / 100, −0.60, +1.20)`. The 7-day change is
+  always in per cent in every source (12.5 means +12.5%). There is no unit
+  heuristic and never a second division by 100.
+- **maturity** = `0.90 + 0.05 × ln(1 + age in months)`, clamped to
+  [0.90, 1.15], measured from `listed_at` to the snapshot date; exactly 1.0
+  when no listing date is recorded.
+- **breadth** = `0.95 + 0.05 × min(number of chains, 6)`.
 
-## Confidence & verdict
-- **HIGH**: ≥3 comps kategori + mcap & change tersedia
-- **MEDIUM**: ≥1 comp
-- **LOW**: 0 comp / data tipis
-- **FARM**: implied ≥ $75M dan confidence ≠ LOW, atau implied ≥ $150M
-  (apa pun confidence-nya)
-- **THIN**: implied ≥ $15M
-- **SKIP**: sisanya
+## Confidence and verdict
 
-## Ranking & board (gate) — diubah 21 Nov 2026
-- **Ranking = implied desc murni.** Rank 1 = implied terbesar; implied tidak
-  boleh naik seiring rank (syarat gate `sorted_by_value`). Verdict
-  (FARM/THIN/SKIP) jadi badge per baris, bukan urutan — sebelumnya FARM
-  dulu lalu THIN lalu SKIP, yang melanggar gate begitu ada baris THIN
-  (mis. Spark, $3.387M) dengan implied lebih besar dari FARM terbawah.
-- **board.json**: `rows` = array baris (bukan hitungan); tiap baris membawa
-  `slug`, `implied_value_usd`, `farm_steps` (7 langkah, tiap langkah 20-600
-  karakter) sesuai syarat gate. Field model lain (`implied`, `plan`,
-  `multiple`, `growth`, ...) tetap ada sebagai extra keys.
-- **CEX/Bridge/Canonical Bridge/Infrastructure/Wallets tidak masuk board**
-  — kalau masuk, Binance CEX ($29,7B implied) jadi rank 1 dan baris Bridge
-  raksasa (LayerZero V2, Coinbase Bridge, WBTC, ...) mendominasi top-10
-  sebagai SKIP. "Chain" TIDAK dikecualikan: 2 slug watchlist
-  (hive-protocol, noble) berkategori Chain.
+- **HIGH**: the category has at least 3 token-bearing neighbours (a market
+  cap or a CoinGecko id recorded) and the 7-day change is reported.
+- **MEDIUM**: at least 1 such neighbour. **LOW**: otherwise.
+- **FARM**: implied ≥ $75M with confidence other than LOW, or implied ≥
+  $150M whatever the confidence. **THIN**: implied ≥ $15M. **SKIP**: the rest.
+- Ranking is pure implied value, descending. Verdict is only a badge on each
+  row, never the sort order.
 
-## Deteksi token keluarga & nama berversi (ditambah 21 Nov 2026)
-- **Family key**: simbol uppercase (bukan "-") + nama dasar ternormalisasi (lowercase, tanpa tanda baca, tanpa akhiran versi). Kalau satu entri se-family punya bukti token (mcap>0 / cmc / gecko / field token), seluruh keluarga keluar dari pre-token — menangkap keluarga yang snapshot-nya MENCATAT bukti token (Aave, Sushi, ...). Untuk keluarga yang snapshot-nya tidak mencatat bukti apa pun (Morpho/MORPHO, Sky/SKY, Ethena/ENA, Uniswap/UNI, Compound/COMP), buktinya datang dari token evidence yang di-vendor (lihat bagian di bawah).
-- **Variant**: nama cocok `/\bV[0-9]+(\.[0-9]+)?$/i` → `variant:true`, tidak dihitung watchlist, verdict maksimal THIN; entri nama dasar se-family tetap jadi baris utama.
+## Families, versions, and already-trading tokens
 
-## Token evidence (external, vendored) — ditambah 21 Nov 2026
-**Kenapa:** snapshot segel tidak mencatat token — entri Morpho Blue, Sky
-Lending, Ethena USDe, Uniswap V3, Compound V3 semuanya `gecko_id: null` /
-`mcap: null`, dan dump DefiLlama mentah pun sama (entri induknya tidak ada
-di data). Model tidak bisa melihat token yang sudah trading dari snapshot
-saja.
-**Sumber:** CoinGecko `coins/markets` (top 10.000 by market cap),
-diambil 21 Nov 2026 via `fetch-coingecko.py` (paginasi 250/halaman, sleep
-4 detik antar request, ~15 req/menit), disimpan ke `token_evidence.json`
-dan ikut di-commit. **Program tetap offline/deterministik**: file dibaca
-dari repo saat jalan, tanpa network.
-**Matching** (per baris bersimbol): kandidat = `entries[SYMBOL]`.
-Match **kuat** kalau kandidat unik, ATAU rank ≤ 500, ATAU nama kandidat
-mirip nama protocol (lowercase, tanpa tanda baca, tanpa kata umum
-v2/v3/finance/protocol/lab — tanpa exact-name wajib, mis. Morpho Blue ↔
-Morpho). Match lemah/ambigu: tidak di-exclude, hanya risk note
-"ticker X ambigu di data pasar".
-**Aturan verdict** (match kuat): baris bukan pre-token — verdict di-cap
-THIN (FARM→THIN; THIN/SKIP tidak naik), confidence turun satu tingkat,
-risk #1 mencatat bukti (`Token <SYM> sudah diperdagangkan (evidence:
-<id>, rank <N>, data pasar per <as_of>)`). `board.json` punya section
-`already_trading` (ticker + evidence + protocol yang kena). Flag
-WATCHLIST dibiarkan — itu definisi resmi bounty dari snapshot.
+- **Family rule.** Protocols sharing a symbol are one family. If any member
+  records a token in the snapshot (a market cap or a CoinGecko id), the whole
+  family is out of the board — a bare symbol alone is not proof.
+- **Versioned names.** A name ending in V2, v2, 2.0 or the like is a variant
+  row: it stays on the board, never counts as a watchlist row, and its
+  verdict caps at THIN.
+- **Wrapped / staked products.** A name carrying a whole word "wrapped" or
+  "staked" with no token symbol of its own, or ending in "Staked SOL" /
+  "Staked ETH", is a product of another token and is out. A protocol's own
+  staking product (it carries its own symbol) stays in.
+- **Token evidence.** The snapshot records no token for entries like Morpho
+  Blue or Sky Lending, yet their tokens trade. The entry vendors CoinGecko
+  `coins/markets` data (top 10,000 by market cap, 2026-11-21) in
+  `token_evidence.json` and matches it per row: a strong match (a unique
+  candidate, a top-500 rank, or a similar name) caps the verdict at THIN,
+  drops confidence one level, and puts the ticker in `board.json`'s
+  `already_trading` section. The watchlist flag never changes on evidence.
 
-## Wrapped/staked exclusion (heuristik, di-tune saat snapshot asli tiba)
-- `token` kosong → pre-token
-- exclude: kategori "Liquid Staking"/"Restaking" yang produknya turunan token lain,
-  atau nama/symbol cocok `^(wrapped|staked|st[a-z]?-?)` dengan base token trading.
-  Semua aturan ada di satu fungsi `isWrappedOrStaked()` — mudah diaudit.
+## The board
 
-## Farm plan (7 langkah, digenerate per protocol)
-Pakai data asli: chain utama, kategori, url, twitter. Contoh kerangka:
-1. Kenali protocol (kriteria & risiko inti)
-2. Pilih chain & deposit (chain terbesar menurut TVL)
-3. Strategi yield (berdasar kategori: lending/DEX/perp/restaking)
-4. Lacak poin/insentif (psn untuk airdrop)
-5. Ukuran posisi & limit risiko
-6. Pantau sinyal launch (announcements, testnet, token sale)
-7. Rencana exit (kapan ambil airdrop / cut loss)
+458 rows. Categories CEX, Bridge, Canonical Bridge, Infrastructure and
+Wallets never reach it ("Chain" does — two watchlist slugs are chains).
+`board.json` is `{model: "radar-v1", rows, watchlistCovered,
+already_trading}`; each row carries its factors, its risks, its 7-step farm
+plan (as `farm_steps` and as the numbered `plan`), and its token evidence
+when there is any. `data.js` holds the same object as `window.RADAR` outside
+`dashboard/`, so the dossier's text stays small.
 
-## Dashboard (statis, tanpa network)
-- `data.js`: `window.RADAR = {...}` — board + detail; tinggal di **luar**
-  `dashboard/` (di root output), dimuat via `../data.js` seperti starter —
-  supaya dossier text memuat seluruh source halaman (<64 KB), bukan
-  terpotong data 500 KB.
-- `dashboard/`: `index.html` + `app.css` + `app.js` (file terpisah, bukan
-  satu file inline — syarat gate `dashboard_files`).
-- **Board**: tabel rank/protocol/kategori/chips chain/TVL/7Δ/implied/confidence/verdict;
-  sortable kolom; search; filter kategori & chain & verdict (chips)
-- **Detail**: panel yang bisa dibuka dari baris — breakdown implied value
-  (tiap faktor + angkanya), risks, farm plan 7 langkah, link
-- Estetika: gelap-hangat (senja), tipografi jelas, chip berwarna — "dipilih judge"
+## The dashboard
+
+`dashboard/index.html` + `app.css` + `app.js`, static and offline: a
+sortable, searchable board with verdict/category/chain filters, and a detail
+view per protocol (`?detail=<rank>`, e.g. `?detail=1`) showing the
+implied-value breakdown factor by factor, the risks, and the farm plan.
+Dark-warm dusk theme, clear type, coloured chips.

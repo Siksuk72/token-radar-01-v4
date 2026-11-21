@@ -1,439 +1,679 @@
+// Token Radar — main.ts
+//
+// Build the best token launch radar (make.fun bounty token-radar-01).
+// Reads a sealed DefiLlama snapshot of the protocol universe plus a vendored
+// CoinGecko evidence file, scores every protocol, and writes a ranked board
+// (board.json), the dashboard's data (data.js), a copy of dashboard/ and
+// screenshots/, and a dossier (dossier.json) into the output directory.
+//
+// The program is offline and deterministic: the same input bytes always
+// produce byte-identical outputs. Node.js 22, standard library only.
+//
+// Usage: node main.ts [snapshot-path] [output-dir]
+//   snapshot-path defaults to /input/snapshot.json
+//   output-dir    defaults to /output
+// The evidence file token_evidence.json is read from this file's own
+// directory (the repository root).
+
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildDossier } from './vendor/makefun-board.ts';
+
+// ---------------------------------------------------------------------------
+// Tunables (calibrated; see DESIGN.md for why each value is what it is)
+// ---------------------------------------------------------------------------
+
+// TVL -> market-cap ratios are wild (a few protocols sit at 20-40x), so the
+// ratio is clamped before any averaging. A 15x cap keeps one outlier from
+// owning its whole category's multiple while leaving ordinary ratios alone.
+const RATIO_MIN = 1;
+const RATIO_MAX = 15;
+// How strongly a category's own multiple is trusted over the global one:
+// shrunk = category^(n/(n+PRIOR)) * global^(PRIOR/(n+PRIOR)).
+const SHRINK_PRIOR = 10;
+// Size slope: bigger protocols earn a lower multiple than their category's
+// typical one. multiple *= (refTVL / max(TVL, refTVL)) ^ SLOPE.
+const SIZE_SLOPE = 0.35;
+// Median TVL used when a category has no comps at all.
+const FALLBACK_REF_TVL = 100_000_000;
+// Verdict thresholds, in whole US dollars.
+const FARM_MIN = 75_000_000;
+const FARM_MIN_ANY_CONFIDENCE = 150_000_000;
+const THIN_MIN = 15_000_000;
+// A row is a "small TVL" row below this line.
+const SMALL_TVL = 10_000_000;
+// Position-size bands switch at this TVL.
+const BIG_POSITION_TVL = 100_000_000;
+
+// Categories that never reach the board: exchanges, bridges and wallets are
+// not pre-token protocols waiting on a launch of their own.
+const EXCLUDED_CATEGORIES = new Set([
+  'CEX',
+  'Bridge',
+  'Canonical Bridge',
+  'Infrastructure',
+  'Wallets',
+]);
+
+// A name ends in a version marker: a space followed by V2, v2, 2.0 or the
+// like. Such rows are variants, never the main row of their family.
+const VERSION_SUFFIX = /\bV[0-9]+(\.[0-9]+)?$/i;
+// Whole words that mark a wrapped / staked product of another token.
+const WRAPPED_WORD = /\b(wrapped|staked)\b/i;
+const STAKED_BASE_ASSET = /\bStaked (SOL|ETH)\b/;
+
+// Words that carry no meaning when comparing a protocol name with a token
+// name (dropped before the similarity check).
+const GENERIC_WORDS = new Set([
+  'v2',
+  'v3',
+  'finance',
+  'protocol',
+  'labs',
+  'lab',
+  'network',
+  'token',
+  'app',
+  'exchange',
+  'dex',
+  'platform',
+]);
+
+// Dossier caps from the kit (see the competition's requirements).
+const DOSSIER_CAPS = {
+  text_max_bytes: 163840,
+  screenshots: { max: 4, max_bytes: 262144 },
+  dashboard: { max_files: 993, max_bytes: 50331648 },
+};
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface SnapshotProtocol {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number | null;
+  mcap_usd: number | null;
+  listed_at: string | null;
+  gecko_id: string | null;
+  symbol: string | null;
+}
+
+interface Snapshot {
+  as_of: string;
+  source: string;
+  floor_usd: number;
+  protocols: SnapshotProtocol[];
+  watchlist: string[];
+}
+
+interface EvidenceCandidate {
+  id: string;
+  name: string;
+  rank: number;
+  market_cap: number;
+}
+
+interface EvidenceFile {
+  as_of: string;
+  source: string;
+  entries: Record<string, EvidenceCandidate[]>;
+}
+
+interface TokenEvidence {
+  symbol: string;
+  id: string;
+  name: string;
+  rank: number;
+  market_cap: number;
+}
+
+interface BoardRow {
+  rank: number;
+  slug: string;
+  name: string;
+  symbol: string;
+  category: string | null;
+  chains: string[];
+  tvl: number;
+  change7d: number | null;
+  multiple: number;
+  growth: number;
+  maturity: number;
+  breadth: number;
+  implied: number;
+  implied_value_usd: number;
+  confidence: 'HIGH' | 'MEDIUM' | 'LOW';
+  verdict: 'FARM' | 'THIN' | 'SKIP';
+  variant: boolean;
+  watchlist: boolean;
+  risks: string[];
+  plan: string[];
+  farm_steps: string[];
+  tokenEvidence: TokenEvidence | null;
+}
+
+interface Board {
+  model: string;
+  rows: BoardRow[];
+  watchlistCovered: number;
+  already_trading: AlreadyTrading[];
+}
+
+interface AlreadyTrading {
+  symbol: string;
+  id: string;
+  name: string;
+  rank: number;
+  market_cap: number;
+  protocols: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+function clamp(value: number, low: number, high: number): number {
+  return Math.min(high, Math.max(low, value));
+}
+
+function round3(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+function geomean(values: number[]): number {
+  let sum = 0;
+  for (const value of values) sum += Math.log(value);
+  return Math.exp(sum / values.length);
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid]!;
+  return (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+function isVariant(name: string): boolean {
+  return VERSION_SUFFIX.test(name);
+}
+
 /**
- * TOKEN RADAR — main.ts (Node 22, runs as-is via type stripping)
- * Bounty: make.fun/bounty/token-radar-01
- *
- * Reads a sealed DefiLlama snapshot (/input/snapshot.json), finds pre-token
- * protocols, ranks them by implied launch value, writes:
- *   /output/board.json        — ranked rows (implied value + 7-step farm plan)
- *   /output/data.js           — dashboard data (window.RADAR)
- *   /output/dashboard/        — static offline dashboard
- *   /output/dossier.json      — via vendor buildDossier when available
- *
- * Deterministic: no Date.now()/Math.random() — all randomness-free.
- * Model design: see DESIGN.md. Tunables marked TUNE.
+ * Is this protocol a wrapped / staked product of another token, rather than
+ * a protocol of its own? Two shapes: the name carries a whole word
+ * "wrapped" or "staked" and the protocol records no token symbol of its own
+ * (its symbol, if any, is the product it wraps), or the name ends in a
+ * staked base asset ("Staked SOL", "Staked ETH"). A protocol whose name
+ * says "staking" but which carries its own symbol is its own staking
+ * product and stays in.
  */
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
-import { buildDossier } from "./vendor/makefun-board.ts";
-
-// ---------------- input ----------------
-const inputPath = process.argv[2] ?? "/input/snapshot.json";
-const outDir = process.argv[3] ?? "/output";
-const raw = JSON.parse(fs.readFileSync(inputPath, "utf-8"));
-const list: any[] = Array.isArray(raw) ? raw
-  : Array.isArray(raw.protocols) ? raw.protocols
-  : Array.isArray(raw.data) ? raw.data
-  : Object.values(raw.protocols ?? {});
-if (!list.length) throw new Error("no protocols found in snapshot");
-
-// ---------------- schema (defensif; DefiLlama dump) ----------------
-interface P { [k: string]: any }
-const num = (v: any): number | null =>
-  typeof v === "number" && isFinite(v) ? v : null;
-
-// ---- adaptasi field snapshot segel -> field kanonik (parser saja; model tidak berubah) ----
-// Snapshot segel memakai tvl_usd / mcap_usd / listed_at ("YYYY-MM-DD");
-// dump mentah DefiLlama memakai tvl / mcap / listedAt (unix detik).
-// Semua kode di bawah tetap membaca p.tvl / p.mcap / p.listedAt.
-const parseDate = (s: any): number | null => {
-  if (typeof s !== "string") return null;
-  const ms = Date.parse(s);
-  return isFinite(ms) ? Math.floor(ms / 1000) : null;
-};
-for (const p of list) {
-  if (num(p.tvl) === null && num(p.tvl_usd) !== null) p.tvl = p.tvl_usd;
-  if (num(p.mcap) === null && num(p.mcap_usd) !== null) p.mcap = p.mcap_usd;
-  if (num(p.listedAt) === null) {
-    const d = parseDate(p.listed_at);
-    if (d !== null) p.listedAt = d;
-  }
+function isWrappedOrStaked(protocol: SnapshotProtocol): boolean {
+  if (!protocol.symbol && WRAPPED_WORD.test(protocol.name)) return true;
+  if (STAKED_BASE_ASSET.test(protocol.name)) return true;
+  return false;
 }
 
-// ---- token evidence (external, vendored) ----
-// token_evidence.json dibangun SEKALI dari CoinGecko (top 10k by mcap,
-// 21 Nov 2026, lihat fetch-coingecko.py) dan ikut di-commit; program
-// membacanya offline — tetap deterministik, tanpa network saat jalan.
-// Kalau file tidak ada, matching dilewati (board tetap jalan).
-interface TokenEv { id: string; name: string; rank: number | null; market_cap: number | null }
-let tokenEvidenceMap: Record<string, TokenEv[]> = {};
-let evidenceAsOf = "";
-try {
-  const evPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "token_evidence.json");
-  if (fs.existsSync(evPath)) {
-    const ev = JSON.parse(fs.readFileSync(evPath, "utf-8"));
-    tokenEvidenceMap = ev.entries ?? {};
-    evidenceAsOf = String(ev.as_of ?? "");
-  }
-} catch { /* evidence opsional — board tetap jalan tanpa itu */ }
-
-// ---------------- helpers ----------------
-const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
-const median = (a: number[]): number => {
-  if (!a.length) return NaN;
-  const s = [...a].sort((x, y) => x - y);
-  const m = s.length >> 1;
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
-};
-const geomean = (a: number[]): number =>
-  a.length ? Math.exp(a.reduce((s, x) => s + Math.log(x), 0) / a.length) : NaN;
-
-// ---------------- wrapped / staked exclusion ----------------
-// Aturan tunggal, mudah diaudit (DESIGN.md). Di-tune pada data DefiLlama asli 21 Nov.
-const WRAP_CATS = new Set(["Liquid Staking", "Restaking", "Wrapped Tokens", "Staking"]);
-const NON_FARM_CATS = new Set(["CEX", "Bridge", "Canonical Bridge", "Infrastructure", "Wallets", "Chain"]);
-
-// ---- family key: token yang sudah trading terlihat lewat keluarga ----
-// (a) simbol uppercase non-placeholder, (b) nama dasar ternormalisasi
-// (lowercase, buang tanda baca, buang akhiran versi).
-// Kalau ENTRI MANA PUN se-family menunjukkan bukti token (mcap>0 / cmc /
-// gecko / field token), seluruh entri se-family itu sudah punya token —
-// keluar dari pre-token. Menangkap Morpho/MORPHO, Sky/SKY, Ethena/ENA,
-// Uniswap/UNI, Compound/COMP yang snapshot-nya sendiri tidak mencatat
-// mcap/gecko untuk entri turunannya.
-const normBaseName = (s: string): string =>
-  s.toLowerCase().replace(/[^a-z0-9]+/g, "").replace(/v\d+(\.\d+)?$/, "");
-const tokenEvidence = (p: P): boolean =>
-  (num(p.mcap) ?? 0) > 0 || Boolean(p.cmcId || p.gecko_id || (p as any).token);
-const familyKeys = (p: P): string[] => {
-  const keys: string[] = [];
-  const sym = String(p.symbol ?? "").toUpperCase();
-  if (sym && sym !== "-" && sym.length >= 2) keys.push("sym:" + sym);
-  const base = normBaseName(String(p.name ?? ""));
-  if (base.length >= 3) keys.push("name:" + base);
-  return keys;
-};
-const familyHasToken = new Map<string, boolean>();
-for (const p of list) {
-  if (!tokenEvidence(p)) continue;
-  for (const k of familyKeys(p)) familyHasToken.set(k, true);
-}
-function hasToken(p: P): boolean {
-  if (tokenEvidence(p)) return true;
-  return familyKeys(p).some((k) => familyHasToken.get(k) === true);
-}
-function hasTokenRaw(p: P): boolean {
-  return tokenEvidence(p);
-}
-
-// nama berversi, selaras aturan watchlist resmi: V2/V3/… di akhir nama
-const VARIANT_RE = /\bV[0-9]+(\.[0-9]+)?$/i;
-const isVariant = (p: P): boolean => VARIANT_RE.test(String(p.name ?? ""));
-
-// ---- matching token evidence (vendored) ----
-// Normalisasi nama: lowercase, buang tanda baca, buang kata umum.
-const normNameLoose = (s: string): string =>
-  s.toLowerCase().replace(/[^a-z0-9 ]+/g, " ")
+/**
+ * Normalise a name for comparison: lowercase, drop punctuation, drop
+ * generic words and bare version words, then join with no separator.
+ * "Morpho Blue" and "Morpho" then share the string "morpho".
+ */
+function comparableName(name: string): string {
+  const words = name
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, ' ')
     .split(/\s+/)
-    .filter((w) => w && !["v2", "v3", "v4", "finance", "protocol", "lab", "labs"].includes(w))
-    .join("");
-const nameSimilar = (a: string, b: string): boolean => {
-  const x = normNameLoose(a), y = normNameLoose(b);
-  if (x.length < 3 || y.length < 3) return false;
-  return x.includes(y) || y.includes(x);
-};
-function matchTokenEvidence(p: P): { strong: boolean; ev: TokenEv | null; ambiguous: boolean } {
-  const sym = String(p.symbol ?? "").toUpperCase();
-  if (!sym || sym === "-") return { strong: false, ev: null, ambiguous: false };
-  const cands = tokenEvidenceMap[sym];
-  if (!cands || !cands.length) return { strong: false, ev: null, ambiguous: false };
-  const sorted = [...cands].sort((a, b) => (a.rank ?? 1e9) - (b.rank ?? 1e9));
-  const best = sorted[0];
-  if (cands.length === 1) return { strong: true, ev: best, ambiguous: false };
-  if (best.rank !== null && best.rank <= 500) return { strong: true, ev: best, ambiguous: false };
-  const sim = sorted.find((c) => nameSimilar(c.name, String(p.name ?? "")));
-  if (sim) return { strong: true, ev: sim, ambiguous: false };
-  return { strong: false, ev: best, ambiguous: true };
+    .filter((word) => word.length > 0)
+    .filter((word) => !GENERIC_WORDS.has(word))
+    .filter((word) => !/^v\d+$/.test(word));
+  return words.join('');
 }
-function isWrappedOrStaked(p: P): boolean {
-  const name = String(p.name ?? "");
-  const sym = String(p.symbol ?? "");
-  const cat = String(p.category ?? "");
-  if (WRAP_CATS.has(cat)) {
-    return /^(wrapped|staked|st[A-Z]|w[A-Z]{2,})/.test(sym)
-      || /(^|[^a-z])(wrapped|staked)([^a-z]|$)/i.test(name);
+
+/** "$2.8B" / "$1.6B" / "$8.2M": one decimal, rounded. */
+function shortDollars(value: number): string {
+  if (value >= 1_000_000_000) return `$${(value / 1_000_000_000).toFixed(1)}B`;
+  if (value >= 1_000_000) return `$${(value / 1_000_000).toFixed(1)}M`;
+  return `$${(value / 1_000).toFixed(1)}K`;
+}
+
+// ---------------------------------------------------------------------------
+// Input loading
+// ---------------------------------------------------------------------------
+
+function loadSnapshot(path: string): Snapshot {
+  const parsed = JSON.parse(readFileSync(path, 'utf8')) as Snapshot;
+  return parsed;
+}
+
+function loadEvidence(path: string): EvidenceFile {
+  if (!existsSync(path)) return { as_of: '', source: '', entries: {} };
+  return JSON.parse(readFileSync(path, 'utf8')) as EvidenceFile;
+}
+
+// ---------------------------------------------------------------------------
+// The model
+// ---------------------------------------------------------------------------
+
+interface CategoryStats {
+  // Comps for the multiple: same-category protocols that already have a
+  // token AND a recorded market cap, so a ratio mcap/tvl exists.
+  compRatios: number[];
+  compTvls: number[];
+  // Token-bearers for confidence: same-category protocols that record any
+  // token at all (a market cap or a CoinGecko id). A category can record a
+  // token without recording its market cap, and that still counts as a
+  // neighbour to learn from.
+  tokenBearers: number;
+}
+
+/**
+ * The implied value of a protocol's eventual token, from the model in
+ * DESIGN.md: TVL x multiple x growth x maturity x breadth.
+ *
+ * multiple: the category's TVL->market-cap multiple, shrunk toward the
+ * global multiple, then bent down for protocols bigger than their
+ * category's typical comp. growth: the 7-day TVL change, always in per
+ * cent in every source (12.5 means +12.5%, never a fraction). maturity:
+ * older pre-token protocols are worth a little more. breadth: more chains
+ * are worth a little more.
+ */
+function buildCategoryStats(protocols: SnapshotProtocol[]): Map<string, CategoryStats> {
+  const stats = new Map<string, CategoryStats>();
+  for (const protocol of protocols) {
+    if (protocol.category === null) continue;
+    let entry = stats.get(protocol.category);
+    if (!entry) {
+      entry = { compRatios: [], compTvls: [], tokenBearers: 0 };
+      stats.set(protocol.category, entry);
+    }
+    if (protocol.tvl_usd > 0 && (protocol.mcap_usd !== null || protocol.gecko_id !== null)) {
+      entry.tokenBearers += 1;
+    }
+    if (protocol.tvl_usd > 0 && protocol.mcap_usd !== null && protocol.mcap_usd > 0) {
+      entry.compRatios.push(clamp(protocol.mcap_usd / protocol.tvl_usd, RATIO_MIN, RATIO_MAX));
+      entry.compTvls.push(protocol.tvl_usd);
+    }
   }
-  return /^(wrapped|staked)([^a-z]|$)/i.test(name)
-    || /^st[A-Z]/.test(sym) && sym.length <= 6
-    || /^W[A-Z0-9]{3,}$/.test(sym); // WBTC, WSTETH, ... wrapped er
+  return stats;
 }
 
-// ---------------- split: pre-token vs comps ----------------
-const pre: P[] = [];
-const comps: P[] = [];
-for (const p of list) {
-  if (hasTokenRaw(p)) comps.push(p);
-  else if (!hasToken(p) && !isWrappedOrStaked(p)) pre.push(p);
-}
-
-// ---------------- comps model ----------------
-const globalRatios: number[] = [];
-const byCat = new Map<string, { ratios: number[]; tvls: number[] }>();
-for (const c of comps) {
-  const m = num(c.mcap), t = num(c.tvl);
-  if (m === null || t === null || t <= 0) continue;
-  const r = clamp(m / t, 1, 500);
-  globalRatios.push(r);
-  const cat = String(c.category ?? "Unknown");
-  const b = byCat.get(cat) ?? { ratios: [], tvls: [] };
-  b.ratios.push(r); b.tvls.push(t);
-  byCat.set(cat, b);
-}
-const globalG = geomean(globalRatios) || 2;
-const catInfo = new Map<string, { multiple: number; refTVL: number; n: number }>();
-for (const [cat, b] of byCat) {
-  const g = geomean(b.ratios);
-  const n = b.ratios.length;
-  const shrink = n / (n + 10);                     // TUNE
-  catInfo.set(cat, {
-    multiple: Math.exp(Math.log(g) * shrink + Math.log(globalG) * (1 - shrink)),
-    refTVL: median(b.tvls) || 100e6,
-    n,
-  });
-}
-const globalRefTVL = median(globalRatios.map(() => 100e6)); // fallback konstanta
-
-function multipleFor(cat: string, tvl: number): { m: number; comps: number } {
-  const info = catInfo.get(cat);
-  if (!info) return { m: globalG, comps: 0 };
-  const sizeFactor = Math.pow(info.refTVL / Math.max(tvl, info.refTVL), 0.35); // TUNE slope
-  return { m: clamp(info.multiple * sizeFactor, 0.05, 3), comps: info.n };
-}
-
-// ---------------- growth / maturity / breadth ----------------
-function change7dFrac(p: P): number | null {
-  // change_7d SELALU persen di semua sumber (DefiLlama: -10.59 = -10.59%).
-  // Heuristik lama (|x|>2 -> /100) dihapus 21 Nov 2026: salah baca satuan
-  // untuk |x|<=2 (mis. +1.34% dibaca 1.34 -> growth 2.2x).
-  let c = num(p.change_7d);
-  if (c === null) c = num(p.change_7d_pct);
-  if (c === null) return null;
-  return c / 100;
-}
-function growth(p: P): number {
-  const c = change7dFrac(p);
-  if (c === null) return 1;
-  return 1 + clamp(c, -0.6, 1.2);
-}
-// snapshot reference date: dari field tanggal snapshot, atau proxy max(listedAt)
-// snapshot reference date: argv[4] (unix detik) > field tanggal > proxy max(listedAt)
-const refDate: number =
-  (num(process.argv[4]) ?? num(raw.date) ?? num(raw.timestamp) ?? num(raw.snapshot_time) ??
-    parseDate(raw.as_of) ??
-    Math.max(...list.map((p: P) => num(p.listedAt) ?? 0))) ||
-  Math.floor(Date.UTC(2026, 10, 14) / 1000); // tanggal snapshot segel bila tak ada
-const DAY = 86400, MONTH = 30.4 * DAY;
-function maturity(p: P): number {
-  const listed = num(p.listedAt);
-  if (listed === null) return 1.0;
-  const months = Math.max(0, (refDate - listed) / MONTH);
-  return clamp(0.90 + 0.05 * Math.log1p(months), 0.90, 1.15);
-}
-const breadth = (p: P): number =>
-  0.95 + 0.05 * Math.min((p.chains ?? []).length, 6);
-
-// ---------------- scoring ----------------
-const WATCHLIST_FLOOR = 50e6;
-const MIN_TVL = 1e6; // TUNE: baris di bawah $1M TVL tidak meaningful — buang (board tetap ≥100 baris)
-const rows = pre.map((p) => {
-  const tvl = num(p.tvl) ?? 0;
-  const cat = String(p.category ?? "Unknown");
-  const { m, comps: nComps } = multipleFor(cat, tvl);
-  const g = growth(p), mat = maturity(p), br = breadth(p);
-  const implied = tvl * m * g * mat * br;
-  const conf: "HIGH" | "MEDIUM" | "LOW" =
-    nComps >= 3 && num(p.change_7d) !== null ? "HIGH" : nComps >= 1 ? "MEDIUM" : "LOW";
-  const chains: string[] = Array.isArray(p.chains) ? p.chains.map(String) : [];
-  const row = {
-    rank: 0,
-    slug: String(p.slug ?? ""),
-    name: String(p.name ?? "(unnamed)"),
-    symbol: String(p.symbol ?? ""),
-    category: cat,
-    chains,
-    tvl,
-    change7d: change7dFrac(p),
-    multiple: +m.toFixed(3),
-    growth: +g.toFixed(3),
-    maturity: +mat.toFixed(3),
-    breadth: +br.toFixed(3),
-    implied: Math.round(implied),
-    implied_value_usd: Math.round(implied),
-    confidence: conf,
-    verdict: "",
-    variant: isVariant(p),
-    watchlist: tvl >= WATCHLIST_FLOOR && !isVariant(p),
-    risks: risksOf(p, nComps),
-    plan: [] as string[],
-    farm_steps: [] as string[],
-  };
-  return row;
-});
-
-function risksOf(p: P, nComps: number): string[] {
-  const r: string[] = [];
-  if (nComps === 0) r.push("Tidak ada comps satu kategori — multiple pakai global");
-  if (num(p.change_7d) === null) r.push("Data perubahan TVL 7 hari tidak tersedia");
-  if ((num(p.tvl) ?? 0) < 10e6) r.push("TVL kecil — insentif farming bisa tipis");
-  if (!p.url && !p.twitter) r.push("Kanal resmi tidak terdata — verifikasi manual");
-  return r;
-}
-
-// verdict
-for (const r of rows) {
-  const nonFarm = NON_FARM_CATS.has(r.category);
-  if (nonFarm) r.risks.push(`Kategori "${r.category}" tidak farmable DeFi — diprioritaskan rendah`);
-  r.verdict = (!nonFarm && ((r.implied >= 75e6 && r.confidence !== "LOW") || r.implied >= 150e6)) ? "FARM"
-    : !nonFarm && r.implied >= 15e6 ? "THIN" : "SKIP";
-  if (r.variant && r.verdict === "FARM") {
-    r.verdict = "THIN";
-    r.risks.push("Nama berversi (V2/V3/…) — verdict maksimal THIN, selaras aturan watchlist resmi");
+function globalMultiple(protocols: SnapshotProtocol[]): number {
+  const ratios: number[] = [];
+  for (const protocol of protocols) {
+    if (protocol.tvl_usd > 0 && protocol.mcap_usd !== null && protocol.mcap_usd > 0) {
+      ratios.push(clamp(protocol.mcap_usd / protocol.tvl_usd, RATIO_MIN, RATIO_MAX));
+    }
   }
-  // token evidence (vendored): token sudah trading -> bukan pre-token.
-  // Verdict di-cap THIN (FARM->THIN; THIN/SKIP tidak naik), confidence
-  // turun satu tingkat, risk #1 mencatat buktinya.
-  const m = matchTokenEvidence(r);
-  if (m.strong && m.ev) {
-    (r as any).tokenEvidence = { symbol: r.symbol, id: m.ev.id, name: m.ev.name, rank: m.ev.rank, market_cap: m.ev.market_cap };
-    if (r.verdict === "FARM") r.verdict = "THIN";
-    r.confidence = r.confidence === "HIGH" ? "MEDIUM" : r.confidence === "MEDIUM" ? "LOW" : "LOW";
-    r.risks.unshift(`Token ${r.symbol} sudah diperdagangkan (evidence: ${m.ev.id}, rank ${m.ev.rank === null || m.ev.rank === undefined ? "n/a" : m.ev.rank}, data pasar per ${evidenceAsOf})`);
-  } else if (m.ambiguous) {
-    r.risks.push(`Ticker ${r.symbol} ambigu di data pasar`);
+  return ratios.length > 0 ? geomean(ratios) : 1;
+}
+
+function multipleFor(
+  protocol: SnapshotProtocol,
+  stats: CategoryStats | undefined,
+  global: number,
+): number {
+  if (!stats || stats.compRatios.length === 0) {
+    // No comps in this category: the global multiple, bent by the fallback
+    // reference TVL.
+    return global * Math.pow(FALLBACK_REF_TVL / Math.max(protocol.tvl_usd, FALLBACK_REF_TVL), SIZE_SLOPE);
+  }
+  const n = stats.compRatios.length;
+  const category = geomean(stats.compRatios);
+  const shrunk = Math.pow(category, n / (n + SHRINK_PRIOR)) * Math.pow(global, SHRINK_PRIOR / (n + SHRINK_PRIOR));
+  const refTvl = median(stats.compTvls);
+  return shrunk * Math.pow(refTvl / Math.max(protocol.tvl_usd, refTvl), SIZE_SLOPE);
+}
+
+function growthFor(protocol: SnapshotProtocol): number {
+  if (protocol.change_7d === null) return 1;
+  // change_7d is in per cent. Never divide by 100 twice: +1.34 means
+  // +1.34%, not a 1.34x move.
+  return 1 + clamp(protocol.change_7d / 100, -0.6, 1.2);
+}
+
+function maturityFor(protocol: SnapshotProtocol, asOf: string): number {
+  if (protocol.listed_at === null) return 1;
+  const listed = Date.parse(`${protocol.listed_at}T00:00:00Z`);
+  const ref = Date.parse(`${asOf}T00:00:00Z`);
+  const ageMonths = Math.max(0, (ref - listed) / 86_400_000 / 30);
+  return clamp(0.9 + 0.05 * Math.log(1 + ageMonths), 0.9, 1.15);
+}
+
+function breadthFor(protocol: SnapshotProtocol): number {
+  return 0.95 + 0.05 * Math.min(protocol.chains.length, 6);
+}
+
+// ---------------------------------------------------------------------------
+// Token evidence
+// ---------------------------------------------------------------------------
+
+type EvidenceMatch = { kind: 'strong'; candidate: EvidenceCandidate } | { kind: 'ambiguous' } | { kind: 'none' };
+
+/**
+ * Does the vendored CoinGecko evidence say this protocol's token already
+ * trades? A match is strong when the ticker has exactly one candidate, or
+ * any candidate sits in the top 500 by market cap, or a candidate's name is
+ * similar to the protocol's name (one comparable name contains the other).
+ * Several candidates and none of those: ambiguous, which is only a risk
+ * note, never evidence.
+ */
+function matchEvidence(protocol: SnapshotProtocol, evidence: EvidenceFile): EvidenceMatch {
+  const symbol = (protocol.symbol ?? '').toUpperCase();
+  if (symbol === '') return { kind: 'none' };
+  const candidates = evidence.entries[symbol];
+  if (!candidates || candidates.length === 0) return { kind: 'none' };
+  if (candidates.length === 1) return { kind: 'strong', candidate: candidates[0]! };
+  const ranked = [...candidates].sort((a, b) => a.rank - b.rank);
+  for (const candidate of ranked) {
+    if (candidate.rank <= 500) return { kind: 'strong', candidate };
+  }
+  const protocolName = comparableName(protocol.name);
+  for (const candidate of ranked) {
+    const candidateName = comparableName(candidate.name);
+    if (candidateName !== '' && protocolName !== '' && (candidateName.includes(protocolName) || protocolName.includes(candidateName))) {
+      return { kind: 'strong', candidate };
+    }
+  }
+  return { kind: 'ambiguous' };
+}
+
+// ---------------------------------------------------------------------------
+// Risks and the farm plan
+// ---------------------------------------------------------------------------
+
+function strategyFor(category: string | null): string {
+  switch (category) {
+    case 'Lending':
+      return 'Deposit di market paling likuid; awasi utilisasi & rate';
+    case 'Liquid Staking':
+      return 'Bagi deposit bertahap; pantau rate stake';
+    case 'RWA':
+      return 'Cek syarat KYC & minimum deposit';
+    case 'Yield':
+      return 'Masuk vault utama; pahami strategi underlying';
+    default:
+      return 'Deposit ke fitur utamanya; mulai kecil';
   }
 }
 
-// farm plan: dibuat SETELAH verdict supaya "risiko inti" (langkah 1)
-// merujuk ke risk #1 final (termasuk bukti token kalau ada).
-for (const r of rows) { r.plan = farmPlan(r); r.farm_steps = r.plan.map(normStep); }
+function buildRisks(
+  protocol: SnapshotProtocol,
+  evidence: EvidenceMatch,
+  candidate: EvidenceCandidate | null,
+  evidenceAsOf: string,
+  compCount: number,
+  variant: boolean,
+  floorUsd: number,
+): string[] {
+  const risks: string[] = [];
+  if (evidence.kind === 'strong' && candidate !== null) {
+    risks.push(
+      `Token ${(protocol.symbol ?? '').toUpperCase()} sudah diperdagangkan (evidence: ${candidate.id}, rank ${candidate.rank}, data pasar per ${evidenceAsOf})`,
+    );
+  }
+  if (protocol.tvl_usd < SMALL_TVL) {
+    risks.push('TVL kecil — insentif farming bisa tipis');
+  }
+  if (compCount === 0) {
+    risks.push('Tidak ada comps satu kategori — multiple pakai global');
+  }
+  if (protocol.change_7d === null) {
+    risks.push('Data perubahan TVL 7 hari tidak tersedia');
+  }
+  // The snapshot carries no official-channel data for any protocol.
+  risks.push('Kanal resmi tidak terdata — verifikasi manual');
+  if (variant && protocol.tvl_usd >= floorUsd) {
+    risks.push('Nama berversi (V2/V3/…) — verdict maksimal THIN, selaras aturan watchlist resmi');
+  }
+  if (protocol.category === 'Chain') {
+    risks.push('Kategori "Chain" tidak farmable DeFi — diprioritaskan rendah');
+  }
+  if (evidence.kind === 'ambiguous') {
+    risks.push(`Ticker ${(protocol.symbol ?? '').toUpperCase()} ambigu di data pasar`);
+  }
+  return risks;
+}
 
-// Kategori yang tidak masuk board sama sekali (bukan cuma SKIP):
-// CEX/Bridge/Canonical Bridge/Infrastructure/Wallets — kalau masuk,
-// baris Bridge raksasa (LayerZero V2, Coinbase Bridge, WBTC, ...) akan
-// mendominasi top-10 sebagai SKIP. "Chain" TIDAK dikecualikan: 2 slug
-// watchlist (hive-protocol, noble) berkategori Chain.
-const BOARD_EXCLUDE_CATS = new Set(["CEX", "Bridge", "Canonical Bridge", "Infrastructure", "Wallets"]);
-
-// ranking: implied desc MURNI (gate: implied tidak boleh naik seiring rank).
-// Verdict (FARM/THIN/SKIP) tetap jadi badge per baris, bukan urutan rank.
-rows.sort((a, b) => (b.implied - a.implied) || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
-rows.forEach((r, i) => (r.rank = i + 1));
-const keep = rows.filter((r) => r.tvl >= MIN_TVL && !BOARD_EXCLUDE_CATS.has(r.category));
-keep.forEach((r, i) => (r.rank = i + 1));
-
-// farm plan (7 langkah, digenerate dari data asli)
-function farmPlan(r: (typeof rows)[0]): string[] {
-  const chain = r.chains[0] ?? "chain terbesar (cek DefiLlama)";
-  const byCatPlan: Record<string, string> = {
-    "Dexes": "Sediakan likuiditas di pool utama; imbangi risiko IL",
-    "Lending": "Deposit di market paling likuid; awasi utilisasi & rate",
-    "Perpetuals": "Coba trading kecil; cek fee rebate / points trading",
-    "Yield": "Masuk vault utama; pahami strategi underlying",
-    "Bridge": "Jadilah user bridge; catat volume transaksi",
-    "RWA": "Cek syarat KYC & minimum deposit",
-    "Liquid Staking": "Bagi deposit bertahap; pantau rate stake",
-  };
-  const s3 = byCatPlan[r.category] ?? "Deposit ke fitur utamanya; mulai kecil";
+function buildFarmSteps(protocol: SnapshotProtocol, risks: string[]): string[] {
+  const firstRisk = risks.length > 0 ? risks[0]! : 'Kanal resmi tidak terdata — verifikasi manual';
+  const chains = protocol.chains;
+  let chainStep = `Pilih chain: mulai dari ${chains[0] ?? 'Ethereum'}`;
+  if (chains.length > 1) {
+    chainStep += ` (juga aktif di ${chains.slice(1, 3).join(', ')})`;
+  }
+  const band = protocol.tvl_usd >= BIG_POSITION_TVL ? '0.5–1%' : '1–2%';
   return [
-    `1. Kenali protocol: baca dokumen & audit; risiko inti: ${r.risks[0] ?? "standar"}`,
-    `2. Pilih chain: mulai dari ${chain}${r.chains.length > 1 ? ` (juga aktif di ${r.chains.slice(1, 3).join(", ")})` : ""}`,
-    `3. Strategi: ${s3}`,
-    `4. Lacak insentif: pantau X/Discord resmi untuk program poin/token`,
-    `5. Ukuran posisi: maks ${r.tvl >= 100e6 ? "0.5–1%" : "1–2%"} dari porto (TVL ${fmt$(r.tvl)})`,
-    `6. Sinyal launch: pantua governance/snapshot; siapkan wallet yang dipakai farming`,
-    `7. Exit: jual airdrop terhadap rencana; kelurk deposit bertahap`,
+    `Kenali protocol: baca dokumen & audit; risiko inti: ${firstRisk}`,
+    chainStep,
+    `Strategi: ${strategyFor(protocol.category)}`,
+    'Lacak insentif: pantau X/Discord resmi untuk program poin/token',
+    `Ukuran posisi: maks ${band} dari porto (TVL ${shortDollars(protocol.tvl_usd)})`,
+    'Sinyal launch: pantua governance/snapshot; siapkan wallet yang dipakai farming',
+    'Exit: jual airdrop terhadap rencana; kelurk deposit bertahap',
   ];
 }
-function fmt$(n: number): string {
-  return n >= 1e9 ? `$${(n / 1e9).toFixed(1)}B` : n >= 1e6 ? `$${(n / 1e6).toFixed(1)}M` : `$${Math.round(n)}`;
-}
-// farm_steps (gate): 3-12 string, tiap string 20-600 karakter setelah trim.
-// Prefix "N. " dibuang (array sudah berurutan); yang kepanjangan dipotong,
-// yang kependekan dilengkapi — mengikuti stepText starter.
-function normStep(s: string): string {
-  let t = s.replace(/^\d+\.\s*/, "").trim();
-  if (t.length > 600) t = t.slice(0, 597).trimEnd() + "...";
-  if (t.length < 20) t = t + " Hold the position and check the protocol's own page.";
-  return t;
+
+function downgrade(confidence: BoardRow['confidence']): BoardRow['confidence'] {
+  if (confidence === 'HIGH') return 'MEDIUM';
+  if (confidence === 'MEDIUM') return 'LOW';
+  return 'LOW';
 }
 
-// ---------------- outputs ----------------
-fs.mkdirSync(outDir, { recursive: true });
-fs.mkdirSync(path.join(outDir, "dashboard"), { recursive: true });
+// ---------------------------------------------------------------------------
+// Board assembly
+// ---------------------------------------------------------------------------
 
-// already_trading: ticker + evidence yang kena aturan token evidence
-// (hanya baris yang tampil di board) — transparansi penuh.
-const atMap = new Map<string, { symbol: string; id: string; name: string; rank: number | null; market_cap: number | null; protocols: string[] }>();
-for (const r of keep) {
-  const te = (r as any).tokenEvidence;
-  if (!te) continue;
-  const key = String(te.symbol).toUpperCase();
-  const cur = atMap.get(key) ?? { symbol: key, id: te.id, name: te.name, rank: te.rank, market_cap: te.market_cap, protocols: [] as string[] };
-  if (!cur.protocols.includes(r.name)) cur.protocols.push(r.name);
-  atMap.set(key, cur);
-}
-const alreadyTrading = [...atMap.values()].sort((a, b) => (a.rank ?? 1e9) - (b.rank ?? 1e9));
+function buildBoard(snapshot: Snapshot, evidence: EvidenceFile): Board {
+  const floor = snapshot.floor_usd;
 
-const board = {
-  model: "radar-v1 (DESIGN.md)",
-  rows: keep,
-  watchlistCovered: keep.filter((r) => r.watchlist).length,
-  already_trading: alreadyTrading,
-};
-fs.writeFileSync(path.join(outDir, "board.json"), JSON.stringify(board, null, 2) + "\n");
-
-const dataJs = "// generated by main.ts — data for dashboard/index.html\n" +
-  "window.RADAR = " + JSON.stringify({
-    model: board.model,
-    rows: keep,
-    stats: {
-      total: keep.length,
-      watchlist: board.watchlistCovered,
-      farm: keep.filter((r) => r.verdict === "FARM").length,
-      thin: keep.filter((r) => r.verdict === "THIN").length,
-      skip: keep.filter((r) => r.verdict === "SKIP").length,
-    },
-  }) + ";\n";
-fs.writeFileSync(path.join(outDir, "data.js"), dataJs);
-// data.js HANYA di out/data.js (bukan di dashboard/): dashboard memuatnya
-// via ../data.js (seperti starter) supaya dossier text memuat seluruh
-// source halaman, bukan terpotong data 500 KB.
-
-// dashboard statis: salin SELURUH isi dashboard/ (index.html + app.css + app.js)
-const dashDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "dashboard");
-if (fs.existsSync(path.join(dashDir, "index.html"))) {
-  for (const f of fs.readdirSync(dashDir)) {
-    const src = path.join(dashDir, f);
-    if (fs.statSync(src).isFile()) fs.copyFileSync(src, path.join(outDir, "dashboard", f));
+  // Families: one token, one family. If any member of a family records a
+  // token in the snapshot (a market cap or a CoinGecko id), the whole family
+  // is out of the board — a bare symbol alone is not proof.
+  const proofSymbols = new Set<string>();
+  for (const protocol of snapshot.protocols) {
+    if ((protocol.mcap_usd !== null && protocol.mcap_usd > 0) || protocol.gecko_id !== null) {
+      if (protocol.symbol) proofSymbols.add(protocol.symbol.toUpperCase());
+    }
   }
-} else {
-  // fallback: tulis versi minimal agar out/ tetap valid
-  fs.writeFileSync(path.join(outDir, "dashboard", "index.html"),
-    "<!doctype html><meta charset=utf-8><title>Token Radar</title>" +
-    "<script src='../data.js'></script><p>Board: lihat board.json (dashboard lengkap: taruh dashboard/index.html di sebelah main.ts)</p>");
+
+  const included = snapshot.protocols.filter((protocol) => {
+    if (protocol.category !== null && EXCLUDED_CATEGORIES.has(protocol.category)) return false;
+    if (protocol.symbol && proofSymbols.has(protocol.symbol.toUpperCase())) return false;
+    if (isWrappedOrStaked(protocol)) return false;
+    return true;
+  });
+
+  const categoryStats = buildCategoryStats(snapshot.protocols);
+  const global = globalMultiple(snapshot.protocols);
+
+  const rows: BoardRow[] = [];
+  const tradingById = new Map<string, AlreadyTrading>();
+
+  for (const protocol of included) {
+    const stats = protocol.category === null ? undefined : categoryStats.get(protocol.category);
+    const compCount = stats ? stats.compRatios.length : 0;
+    const multiple = round3(multipleFor(protocol, stats, global));
+    const growth = round3(growthFor(protocol));
+    const maturity = round3(maturityFor(protocol, snapshot.as_of));
+    const breadth = round3(breadthFor(protocol));
+    const implied = Math.round(protocol.tvl_usd * multiple * growth * maturity * breadth);
+
+    const variant = isVariant(protocol.name);
+    const match = matchEvidence(protocol, evidence);
+    const candidate = match.kind === 'strong' ? match.candidate : null;
+    const tokenEvidence: TokenEvidence | null =
+      candidate === null
+        ? null
+        : {
+            symbol: (protocol.symbol ?? '').toUpperCase(),
+            id: candidate.id,
+            name: candidate.name,
+            rank: candidate.rank,
+            market_cap: candidate.market_cap,
+          };
+
+    // Confidence: HIGH needs at least 3 token-bearing neighbours in the
+    // category plus a reported 7-day change; MEDIUM needs at least 1;
+    // otherwise LOW. A strong evidence match drops it one level: a token
+    // that already trades is not a pre-token bet any more.
+    const bearers = stats ? stats.tokenBearers : 0;
+    let confidence: BoardRow['confidence'] =
+      bearers >= 3 && protocol.change_7d !== null ? 'HIGH' : bearers >= 1 ? 'MEDIUM' : 'LOW';
+    if (tokenEvidence !== null) confidence = downgrade(confidence);
+
+    // Verdict: FARM is a big implied value with usable confidence (or a
+    // very big implied value whatever the confidence); THIN is a mid-sized
+    // one; the rest is SKIP. Variants and already-trading rows cap at THIN,
+    // and chains are forced to SKIP: a chain is not farmable DeFi.
+    let verdict: BoardRow['verdict'];
+    if ((implied >= FARM_MIN && confidence !== 'LOW') || implied >= FARM_MIN_ANY_CONFIDENCE) {
+      verdict = 'FARM';
+    } else if (implied >= THIN_MIN) {
+      verdict = 'THIN';
+    } else {
+      verdict = 'SKIP';
+    }
+    if ((variant || tokenEvidence !== null) && verdict === 'FARM') verdict = 'THIN';
+    if (protocol.category === 'Chain') verdict = 'SKIP';
+
+    const risks = buildRisks(protocol, match, candidate, evidence.as_of, compCount, variant, floor);
+    const farmSteps = buildFarmSteps(protocol, risks);
+    const plan = farmSteps.map((step, index) => `${index + 1}. ${step}`);
+
+    if (tokenEvidence !== null) {
+      let entry = tradingById.get(tokenEvidence.id);
+      if (!entry) {
+        entry = {
+          symbol: tokenEvidence.symbol,
+          id: tokenEvidence.id,
+          name: tokenEvidence.name,
+          rank: tokenEvidence.rank,
+          market_cap: tokenEvidence.market_cap,
+          protocols: [],
+        };
+        tradingById.set(tokenEvidence.id, entry);
+      }
+      entry.protocols.push(protocol.name);
+    }
+
+    rows.push({
+      rank: 0,
+      slug: protocol.slug,
+      name: protocol.name,
+      symbol: protocol.symbol ?? '',
+      category: protocol.category,
+      chains: protocol.chains,
+      tvl: protocol.tvl_usd,
+      change7d: protocol.change_7d === null ? null : protocol.change_7d / 100,
+      multiple,
+      growth,
+      maturity,
+      breadth,
+      implied,
+      implied_value_usd: implied,
+      confidence,
+      verdict,
+      variant,
+      // The watchlist flag is the snapshot's own definition: at/above the
+      // floor and not a versioned variant. Evidence never changes it.
+      watchlist: protocol.tvl_usd >= floor && !variant,
+      risks,
+      plan,
+      farm_steps: farmSteps,
+      tokenEvidence,
+    });
+  }
+
+  // Ranking is pure implied value, descending. Verdict is only a badge.
+  rows.sort((a, b) => b.implied - a.implied);
+  rows.forEach((row, index) => {
+    row.rank = index + 1;
+  });
+
+  // The already-trading section lists each evidenced ticker once, biggest
+  // market cap first, with the board rows that matched it (in rank order).
+  const rankByName = new Map(rows.map((row) => [row.name, row.rank]));
+  const alreadyTrading = [...tradingById.values()].sort((a, b) => b.market_cap - a.market_cap);
+  for (const entry of alreadyTrading) {
+    entry.protocols.sort((a, b) => (rankByName.get(a) ?? 0) - (rankByName.get(b) ?? 0));
+  }
+
+  return {
+    model: 'radar-v1',
+    rows,
+    watchlistCovered: rows.filter((row) => row.watchlist).length,
+    already_trading: alreadyTrading,
+  };
 }
 
-// screenshots: salin ke out/ (dibutuhkan buildDossier)
-const shotsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "screenshots");
-if (fs.existsSync(shotsDir)) {
-  fs.mkdirSync(path.join(outDir, "screenshots"), { recursive: true });
-  for (const f of fs.readdirSync(shotsDir)) {
-    const src = path.join(shotsDir, f);
-    if (fs.statSync(src).isFile()) fs.copyFileSync(src, path.join(outDir, "screenshots", f));
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+function main(): void {
+  const repoRoot = dirname(fileURLToPath(import.meta.url));
+  const snapshotPath = process.argv[2] ?? '/input/snapshot.json';
+  const outDir = process.argv[3] ?? '/output';
+
+  const snapshot = loadSnapshot(snapshotPath);
+  const evidence = loadEvidence(join(repoRoot, 'token_evidence.json'));
+  const board = buildBoard(snapshot, evidence);
+
+  mkdirSync(outDir, { recursive: true });
+  mkdirSync(join(outDir, 'dashboard'), { recursive: true });
+
+  const boardJson = `${JSON.stringify(board, null, 2)}\n`;
+  writeFileSync(join(outDir, 'board.json'), boardJson);
+  writeFileSync(join(outDir, 'data.js'), `window.RADAR = ${JSON.stringify(board)};\n`);
+
+  // The dashboard is static and offline; copy it as-is.
+  cpSync(join(repoRoot, 'dashboard'), join(outDir, 'dashboard'), { recursive: true });
+
+  // Screenshots are rendered separately (see README) and copied in when
+  // they exist. The dossier needs them; without them the run still writes
+  // the board, the data and the dashboard, and says so.
+  const shotsDir = join(repoRoot, 'screenshots');
+  const shotNames = existsSync(shotsDir)
+    ? readdirSync(shotsDir).filter((name) => !name.startsWith('.')).sort()
+    : [];
+  if (shotNames.length > 0) {
+    mkdirSync(join(outDir, 'screenshots'), { recursive: true });
+    cpSync(shotsDir, join(outDir, 'screenshots'), { recursive: true });
+    const dossier = buildDossier(outDir, DOSSIER_CAPS);
+    writeFileSync(join(outDir, 'dossier.json'), dossier);
+    console.log(`dossier.json written (${dossier.length} bytes)`);
+  } else {
+    console.log('no screenshots/ yet: dossier.json skipped (render them first, then re-run)');
+  }
+
+  const verdicts = { FARM: 0, THIN: 0, SKIP: 0 };
+  const confidences = { HIGH: 0, MEDIUM: 0, LOW: 0 };
+  for (const row of board.rows) {
+    verdicts[row.verdict] += 1;
+    confidences[row.confidence] += 1;
+  }
+  const watchlistSlugs = new Set(snapshot.watchlist);
+  const watchlistPresent = board.rows.filter((row) => watchlistSlugs.has(row.slug)).length;
+  console.log(`rows=${board.rows.length} watchlist=${watchlistPresent}/${snapshot.watchlist.length} covered=${board.watchlistCovered}`);
+  console.log(`verdicts FARM=${verdicts.FARM} THIN=${verdicts.THIN} SKIP=${verdicts.SKIP}`);
+  console.log(`confidence HIGH=${confidences.HIGH} MEDIUM=${confidences.MEDIUM} LOW=${confidences.LOW}`);
+  console.log(`already_trading=${board.already_trading.length} evidence_rows=${board.rows.filter((row) => row.tokenEvidence !== null).length}`);
+  console.log('top 10:');
+  for (const row of board.rows.slice(0, 10)) {
+    console.log(`  ${row.rank}. ${row.name} $${row.implied.toLocaleString('en-US')} ${row.verdict}`);
   }
 }
 
-// dossier: byte-for-byte apa yang buildDossier tulis dari out/dashboard/ +
-// out/screenshots/ (caps = starter). Gagal di sini tidak mematikan board.
-try {
-  fs.writeFileSync(path.join(outDir, "dossier.json"), buildDossier(outDir, {
-    text_max_bytes: 65536,
-    screenshots: { max: 4, max_bytes: 524288 },
-    dashboard: { max_files: 400, max_bytes: 4194304 },
-  }));
-} catch (e) {
-  console.warn(`[token-radar] dossier gagal: ${e instanceof Error ? e.message : String(e)}`);
-}
-
-console.log(`[token-radar] rows=${rows.length} watchlist=${board.watchlistCovered} ` +
-  `FARM=${rows.filter((r) => r.verdict === "FARM").length} already_trading=${alreadyTrading.length} -> ${outDir}`);
+main();

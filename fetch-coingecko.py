@@ -1,94 +1,97 @@
 #!/usr/bin/env python3
-"""Fetch CoinGecko top-10k tokens (coins/markets, by mcap) -> token_evidence.json.
+"""Fetch CoinGecko market data for token-evidence matching.
 
-Rate-limit friendly: 250/page, 40 pages, 4s sleep between requests (~15/min).
-On 429/5xx: wait 60s, retry once; if still failing, stop and build from
-what was fetched. Writes token_evidence.json next to this script's repo dir.
+Pulls the top 10,000 coins by market cap from the CoinGecko
+``coins/markets`` endpoint (250 per page, pages 1-40) and writes a compact
+evidence file mapping each uppercase ticker symbol to the list of coins
+that use it:
+
+    {"as_of": "2026-11-21",
+     "source": "coingecko coins/markets (top 10k by mcap)",
+     "entries": {"WELL": [{"id": "moonwell-artemis", "name": "Moonwell",
+                           "rank": 1470, "market_cap": 5248115}, ...], ...}}
+
+main.ts reads this file at runtime; a token the snapshot does not record
+can still be caught here. Standard library only, no API key needed for the
+public endpoint. Usage:
+
+    python3 fetch-coingecko.py [output.json]
 """
+
 import json
-import os
 import sys
 import time
 import urllib.request
+from datetime import date
 
-OUT_DIR = os.path.dirname(os.path.abspath(__file__))
-RAW_DIR = os.path.join(OUT_DIR, ".coingecko-raw")
-os.makedirs(RAW_DIR, exist_ok=True)
-
-BASE = ("https://api.coingecko.com/api/v3/coins/markets"
-        "?vs_currency=usd&per_page=250&page={page}")
-SLEEP = 4
-MAX_PAGE = 40
-
-
-def fetch_page(page):
-    url = BASE.format(page=page)
-    req = urllib.request.Request(url, headers={
-        "Accept": "application/json",
-        "User-Agent": "token-radar-evidence-builder/1.0",
-    })
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode())
+API_URL = (
+    "https://api.coingecko.com/api/v3/coins/markets"
+    "?vs_currency=usd&order=market_cap_desc&per_page=250&page={page}"
+    "&sparkline=false&price_change_percentage=24h"
+)
+PAGES = 40
+SLEEP_SECONDS = 4
+USER_AGENT = "token-radar/1.0 (token launch radar; contact: make.fun bounty token-radar-01)"
 
 
-def main():
-    all_coins = []
-    seen_ids = set()
-    last_ok = 0
-    for page in range(1, MAX_PAGE + 1):
-        if page > 1:
-            time.sleep(SLEEP)
-        try:
-            data = fetch_page(page)
-        except Exception as e:
-            print(f"page {page}: ERROR {e} -> wait 60s, retry once", flush=True)
-            time.sleep(60)
-            try:
-                data = fetch_page(page)
-            except Exception as e2:
-                print(f"page {page}: RETRY FAILED {e2} -> stop here", flush=True)
-                break
-        if not isinstance(data, list) or not data:
-            print(f"page {page}: empty/non-list response -> stop", flush=True)
+def fetch_page(page: int) -> list:
+    request = urllib.request.Request(
+        API_URL.format(page=page), headers={"User-Agent": USER_AGENT}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        # The public endpoint rate-limits (429) if called too eagerly; wait
+        # out the pause it asks for and try the same page once more.
+        if error.code == 429:
+            wait = int(error.headers.get("Retry-After", "60"))
+            print(f"page {page}: rate-limited, waiting {wait}s and retrying", file=sys.stderr)
+            time.sleep(wait)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response)
+        raise
+
+
+def main() -> int:
+    output_path = sys.argv[1] if len(sys.argv) > 1 else "token_evidence.json"
+    entries: dict[str, list[dict]] = {}
+    fetched = 0
+    for page in range(1, PAGES + 1):
+        coins = fetch_page(page)
+        if not coins:
+            print(f"page {page}: empty, stopping early", file=sys.stderr)
             break
-        with open(os.path.join(RAW_DIR, f"page-{page:02d}.json"), "w") as f:
-            json.dump(data, f)
-        new = 0
-        for c in data:
-            cid = c.get("id")
-            if not cid or cid in seen_ids:
+        for index, coin in enumerate(coins):
+            symbol = str(coin.get("symbol") or "").upper()
+            if not symbol:
                 continue
-            seen_ids.add(cid)
-            all_coins.append(c)
-            new += 1
-        last_ok = page
-        print(f"page {page}: {len(data)} coins ({new} new), total {len(all_coins)}", flush=True)
-
-    entries = {}
-    for c in all_coins:
-        sym = (c.get("symbol") or "").upper()
-        if not sym or sym == "-":
-            continue
-        entries.setdefault(sym, []).append({
-            "id": c.get("id"),
-            "name": c.get("name"),
-            "rank": c.get("market_cap_rank"),
-            "market_cap": c.get("market_cap"),
-        })
-    for sym in entries:
-        entries[sym].sort(key=lambda e: (e["rank"] is None, e["rank"] or 10 ** 9))
-
-    out = {
-        "as_of": "2026-11-21",
+            rank = coin.get("market_cap_rank")
+            if not isinstance(rank, int):
+                rank = (page - 1) * 250 + index + 1
+            entries.setdefault(symbol, []).append(
+                {
+                    "id": coin.get("id"),
+                    "name": coin.get("name"),
+                    "rank": rank,
+                    "market_cap": coin.get("market_cap") or 0,
+                }
+            )
+            fetched += 1
+        print(f"page {page}: {len(coins)} coins, {fetched} total")
+        if page < PAGES:
+            time.sleep(SLEEP_SECONDS)
+    evidence = {
+        "as_of": date.today().isoformat(),
         "source": "coingecko coins/markets (top 10k by mcap)",
         "entries": entries,
     }
-    out_path = os.path.join(OUT_DIR, "token_evidence.json")
-    with open(out_path, "w") as f:
-        json.dump(out, f, indent=1, sort_keys=True)
-    print(f"DONE pages={last_ok} coins={len(all_coins)} tickers={len(entries)} -> {out_path}")
-    print(f"file bytes: {os.path.getsize(out_path)}")
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(evidence, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+    print(f"wrote {output_path}: {fetched} coins, {len(entries)} symbols")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

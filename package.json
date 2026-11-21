@@ -1,6 +1,1 @@
-{
-  "name": "token-radar",
-  "private": true,
-  "type": "module",
-  "license": "MIT"
-}
+{"license":"MIT","name":"token-radar","private":true,"scripts":{"build":"node main.ts input/snapshot.json out"},"type":"module"}

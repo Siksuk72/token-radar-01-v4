@@ -1,32 +1,40 @@
-# 📡 Token Radar — Brief Resmi (token-radar-01)
+# Token Radar — Brief (token-radar-01)
 
-Sumber: make.fun/bounty/token-radar-01 (dihapus unduh 20 Nov 2026)
+Bounty: **"Build the best token launch radar"** on make.fun.
 
 | Item | Detail |
 |------|--------|
-| Hadiah | $1.325 total: **#1 = $1.000**, #2–5 = $50, #6–10 = $25 |
-| Deadline | **Senin 14 Des 2026, 10:00 UTC** (±23 hari) |
-| Penilaian | AI judge membandingkan dashboard 2-per-2 → ranking dari frekuensi dipilih |
-| Limit | Maks 5 submission/hari, 10 total; terakhir sebelum deadline = final |
+| Prize | $1,325 total: **#1 = $1,000**, #2–5 = $50, #6–10 = $25 |
+| Entry deadline | **Monday 14 December 2026, 10:00 UTC** |
+| Judging | An AI judge compares dashboards two at a time; entries rank by how often they are picked |
+| Entry limits | At most 5 submissions a day, 10 in total; the last one before the deadline is final |
 
-## Tugas
-Build the best token launch radar: baca **sealed snapshot** (`/input/snapshot.json`,
-semua protocol yang Diligence/DefiLlama track) → tentukan protocol yang **belum punya
-token** (dan bukan wrapped/staked product dari token yang sudah trading) → ranking
-berdasarkan **nilai yang akan dihasilkan peluncurannya** → dashboard web: board +
-detail view tiap protocol + langkah farming-nya.
+## The task
+
+Build the best token launch radar: read a sealed snapshot of the protocol
+universe (every protocol DefiLlama tracks at or above $5,000,000 of TVL),
+work out which protocols record no token yet (and are not wrapped or staked
+products of a token that already trades), rank them by the value their launch
+would imply, and hand in a dashboard a reader can actually use: a board, a
+detail view for every protocol, and the steps to farm it.
 
 ## Deliverables
-- Repo GitHub publik (OSI license), dibuat setelah kompetisi buka
-- `main.ts` (Node 22) di root — baca `/input/*.in`-style snapshot → tulis `/output/`
-- `vendor/makefun-board.ts` dari kit, jangan diubah
-- `dashboard/` — halaman statis, render **tanpa network**
-- `board.json` — **minimal 100 baris**, watchlist 40 protocol lengkap, tiap baris:
-  implied value + **farm plan**
-- `screenshots/` — 3 screenshot asli: **board**, **detail view**, **filtered view**
-- `dossier.json` — dibuat dengan `buildDossier` dari vendor
-- Transkrip sesi agent (kit record)
 
-## Syarat wajib
-- Dashboard yang usable: board + detail view untuk setiap protocol + filter
-- Node.js 22.18+ ✓ (tersedia) · Browser ✓ (Chrome ada)
+- A public GitHub repository (OSI license), created after the competition opened
+- `main.ts` (Node 22, standard library only) at the root — reads the snapshot,
+  writes the output directory
+- `vendor/makefun-board.ts` from the kit, byte for byte, never modified
+- `dashboard/` — static pages that render with no network
+- `board.json` — at least 100 rows, the full 40-protocol watchlist covered,
+  every row with an implied value and a farm plan
+- `screenshots/` — 3 real screenshots: the board, a detail view, a filtered view
+- `dossier.json` — built with `buildDossier` from the vendor file
+- The transcript bundle of the agent sessions that built the entry
+
+## How the board is judged
+
+The entry is the dashboard, not the code: the AI judge compares dashboards
+two at a time and ranks entries by how often they are picked. So the board
+must be readable at a glance (rank, implied value, verdict) and the detail
+view must explain itself (factor breakdown, risks, farm plan) without the
+reader ever opening the source.
