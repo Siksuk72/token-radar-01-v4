@@ -634,7 +634,9 @@ function main(): void {
   mkdirSync(outDir, { recursive: true });
   mkdirSync(join(outDir, 'dashboard'), { recursive: true });
 
-  const boardJson = `${JSON.stringify(board, null, 2)}\n`;
+  // Compact single-line JSON: board.json is machine-generated data; pretty-
+  // printing it would add ~24,000 lines of whitespace without changing a value.
+  const boardJson = `${JSON.stringify(board)}\n`;
   writeFileSync(join(outDir, 'board.json'), boardJson);
   writeFileSync(join(outDir, 'data.js'), `window.RADAR = ${JSON.stringify(board)};\n`);
 
