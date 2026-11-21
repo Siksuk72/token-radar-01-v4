@@ -1,71 +1,272 @@
-"use strict";
-const R = window.RADAR; const rows = R.rows;
-const $ = id => document.getElementById(id);
-const fmtM = n => n >= 1e9 ? '$' + (n/1e9).toFixed(2)+'B' : n >= 1e6 ? '$'+(n/1e6).toFixed(1)+'M' : '$'+Math.round(n);
-// stats
-$('stats').innerHTML =
-  `<span><b>${R.stats.total}</b> protocol pre-token</span><span><b>${R.stats.watchlist}</b> watchlist (TVL ≥ $50M)</span>`+
-  `<span><b style="color:var(--farm)">${R.stats.farm}</b> FARM</span><span><b style="color:var(--thin)">${R.stats.thin}</b> THIN</span><span><b>${R.stats.skip}</b> SKIP</span>`;
-// filter options
-const cats = [...new Set(rows.map(r=>r.category))].sort();
-const chs = [...new Set(rows.flatMap(r=>r.chains))].sort();
-$('cat').innerHTML += cats.map(c=>`<option>${c}</option>`).join('');
-$('chain').innerHTML += chs.map(c=>`<option>${c}</option>`).join('');
-// state
-let verdict="ALL", sortKey="rank", sortDir=1, openRow=null;
-document.querySelectorAll('.chip').forEach(ch=>ch.onclick=()=>{document.querySelectorAll('.chip').forEach(x=>x.classList.remove('on'));ch.classList.add('on');verdict=ch.dataset.v;render()});
-$('q').oninput = render; $('cat').onchange = render; $('chain').onchange = render;
-document.querySelectorAll('th[data-s]').forEach(th=>th.onclick=()=>{const k=th.dataset.s;sortDir=(sortKey===k?-sortDir:1);sortKey=k;render()});
-function filtered(){
-  const q=$('q').value.toLowerCase(), cat=$('cat').value, ch=$('chain').value;
-  return rows.filter(r=>
-    (verdict==="ALL"||r.verdict===verdict) && (!cat||r.category===cat) && (!ch||r.chains.includes(ch)) &&
-    (!q||r.name.toLowerCase().includes(q)||r.category.toLowerCase().includes(q)||r.chains.join(' ').toLowerCase().includes(q)))
-  .sort((a,b)=>{const x=a[sortKey],y=b[sortKey];return (typeof x==="string"?x.localeCompare(y):x-y)*sortDir});
-}
-function render(){
-  const f=filtered();
-  $('count').textContent = f.length + " baris";
-  $('tb').innerHTML = f.map(r=>`<tr class="r" onclick="openDetail(${r.rank})">
-    <td>${r.rank}</td><td><b>${r.name}</b> ${r.symbol?`<span class="c">(${r.symbol})</span>`:""} ${r.watchlist?'<span class="bdg" style="background:#3b2c17;color:#ffd24d">WATCHLIST</span>':''}</td>
-    <td>${r.category}</td><td>${r.chains.slice(0,3).map(c=>`<span class="bdg">${c}</span>`).join('')}${r.chains.length>3?'<span class="c">+'+(r.chains.length-3)+'</span>':''}</td>
-    <td>${fmtM(r.tvl)}</td><td class="c">${r.change7d==null?'—':(r.change7d>0?'+':'')+(r.change7d*100).toFixed(1)+'%'}</td>
-    <td class="imp">${fmtM(r.implied)}</td><td><span class="conf ${r.confidence}">${r.confidence[0]}</span></td>
-    <td><span class="v ${r.verdict}">${r.verdict}</span></td></tr>`).join('');
-}
-function openDetail(rank){
-  const r=rows.find(x=>x.rank===rank); openRow=rank;
-  $('dBody').innerHTML=`
-    <h2>${r.name}</h2><div class="c">${r.category} · ${r.chains.join(', ')||'—'} · TVL ${fmtM(r.tvl)}</div>
-    <div class="kv">
-      <b>Implied value</b><span class="imp" style="font-size:20px">${fmtM(r.implied)}</span>
-      <b>Verdict</b><span class="v ${r.verdict}">${r.verdict}</span>
-      <b>Confidence</b><span class="conf ${r.confidence}">${r.confidence}</span>
-    </div>
-    <div style="margin:10px 0 4px" class="c">— dari mana angkanya (model radar-v1) —</div>
-    <div class="factor"><span>TVL</span><b>${fmtM(r.tvl)}</b></div>
-    <div class="factor"><span>× multiple kategori (size-adjusted)</span><b>${r.multiple}</b></div>
-    <div class="factor"><span>× growth 7 hari</span><b>${r.growth}</b></div>
-    <div class="factor"><span>× maturity (usia tanpa token)</span><b>${r.maturity}</b></div>
-    <div class="factor"><span>× breadth (jumlah chain)</span><b>${r.breadth}</b></div>
-    <div style="margin:14px 0 4px" class="c">— risiko yang diakui —</div>
-    ${r.risks.map(x=>`<div class="risk">⚠ ${x}</div>`).join('') || '<div class="c">tidak ada risiko data yang menonjol</div>'}
-    <div style="margin:14px 0 4px" class="c">— langkah farming (7) —</div>
-    <ol class="plan">${r.plan.map(p=>`<li>${p.replace(/^\d+\.\s*/,'')}</li>`).join('')}</ol>`;
-  $('detail').style.display='block';
-}
-function closeDetail(){$('detail').style.display='none'}
-render();
+// Token Radar — dashboard logic. Reads window.RADAR (written by main.ts
+// into data.js beside this page) and renders the board, the filters and the
+// detail view. Fully offline: no network calls of any kind.
 
-// dukungan deep-link untuk screenshot/berbagi: ?verdict=FARM&cat=X&chain=Y&q=z&detail=5
-const params = new URLSearchParams(location.search);
-if (params.get('verdict')) {
-  const v = params.get('verdict');
-  document.querySelectorAll('.chip').forEach(x => x.classList.toggle('on', x.dataset.v === v));
-  verdict = v;
-}
-if (params.get('cat')) $('cat').value = params.get('cat');
-if (params.get('chain')) $('chain').value = params.get('chain');
-if (params.get('q')) $('q').value = params.get('q');
-render();
-if (params.get('detail')) openDetail(+params.get('detail'));
+(function () {
+  'use strict';
+
+  var DATA = window.RADAR || { model: '', rows: [], watchlistCovered: 0, already_trading: [] };
+  var ROWS = DATA.rows || [];
+
+  var $ = function (id) { return document.getElementById(id); };
+  var searchInput = $('search');
+  var verdictChips = $('verdict-chips');
+  var categoryFilter = $('category-filter');
+  var chainFilter = $('chain-filter');
+  var rowsEl = $('rows');
+  var countEl = $('count');
+  var emptyEl = $('empty');
+  var detailEl = $('detail');
+  var statsEl = $('stats');
+
+  var params = new URLSearchParams(window.location.search);
+  var state = {
+    q: params.get('q') || '',
+    verdict: params.get('verdict') || '',
+    category: params.get('cat') || '',
+    chain: params.get('chain') || '',
+    sortKey: 'rank',
+    sortDir: 1,
+    detailRank: params.get('detail') ? parseInt(params.get('detail'), 10) : null,
+  };
+
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function dollars(value) {
+    if (value >= 1e9) return '$' + (value / 1e9).toFixed(1) + 'B';
+    if (value >= 1e6) return '$' + (value / 1e6).toFixed(1) + 'M';
+    if (value >= 1e3) return '$' + (value / 1e3).toFixed(1) + 'K';
+    return '$' + Math.round(value);
+  }
+
+  function dollarsFull(value) {
+    return '$' + value.toLocaleString('en-US');
+  }
+
+  function pct(value) {
+    if (value === null || value === undefined) return '—';
+    var sign = value > 0 ? '+' : '';
+    return sign + (value * 100).toFixed(2) + '%';
+  }
+
+  function verdictRank(v) { return v === 'FARM' ? 0 : v === 'THIN' ? 1 : 2; }
+  function confidenceRank(c) { return c === 'HIGH' ? 0 : c === 'MEDIUM' ? 1 : 2; }
+
+  function sortValue(row, key) {
+    if (key === 'confidence') return confidenceRank(row.confidence);
+    if (key === 'verdict') return verdictRank(row.verdict);
+    if (key === 'change7d') return row.change7d === null ? -Infinity : row.change7d;
+    return row[key];
+  }
+
+  function filteredRows() {
+    var q = state.q.trim().toLowerCase();
+    var list = ROWS.filter(function (row) {
+      if (state.verdict && row.verdict !== state.verdict) return false;
+      if (state.category && row.category !== state.category) return false;
+      if (state.chain && row.chains.indexOf(state.chain) === -1) return false;
+      if (q && row.name.toLowerCase().indexOf(q) === -1 && row.slug.indexOf(q) === -1) return false;
+      return true;
+    });
+    list.sort(function (a, b) {
+      var va = sortValue(a, state.sortKey);
+      var vb = sortValue(b, state.sortKey);
+      if (va < vb) return -1 * state.sortDir;
+      if (va > vb) return 1 * state.sortDir;
+      return (a.rank - b.rank) * state.sortDir;
+    });
+    return list;
+  }
+
+  function renderStats() {
+    var farm = ROWS.filter(function (r) { return r.verdict === 'FARM'; }).length;
+    statsEl.innerHTML =
+      '<div class="stat"><b>' + ROWS.length + '</b><span>protocols ranked</span></div>' +
+      '<div class="stat"><b>' + DATA.watchlistCovered + '</b><span>watchlist rows</span></div>' +
+      '<div class="stat"><b>' + farm + '</b><span>FARM verdicts</span></div>' +
+      '<div class="stat"><b>' + (DATA.already_trading || []).length + '</b><span>tokens already trading</span></div>';
+  }
+
+  function renderFilters() {
+    var categories = [];
+    var chains = [];
+    ROWS.forEach(function (row) {
+      if (row.category && categories.indexOf(row.category) === -1) categories.push(row.category);
+      row.chains.forEach(function (chain) {
+        if (chains.indexOf(chain) === -1) chains.push(chain);
+      });
+    });
+    categories.sort();
+    chains.sort();
+    categories.forEach(function (category) {
+      var option = document.createElement('option');
+      option.value = category;
+      option.textContent = category;
+      categoryFilter.appendChild(option);
+    });
+    chains.forEach(function (chain) {
+      var option = document.createElement('option');
+      option.value = chain;
+      option.textContent = chain;
+      chainFilter.appendChild(option);
+    });
+    searchInput.value = state.q;
+    categoryFilter.value = state.category;
+    chainFilter.value = state.chain;
+  }
+
+  function renderTable() {
+    var list = filteredRows();
+    countEl.textContent = 'Showing ' + list.length + ' of ' + ROWS.length + ' protocols, ranked by implied value.';
+    emptyEl.hidden = list.length !== 0;
+    var html = list.map(function (row) {
+      var changeClass = row.change7d === null ? '' : row.change7d >= 0 ? 'pos' : 'neg';
+      var chainChips = row.chains.slice(0, 4).map(function (chain) {
+        return '<span class="chain-chip">' + escapeHtml(chain) + '</span>';
+      }).join('');
+      var extraChains = row.chains.length > 4 ? ' <span class="chain-chip">+' + (row.chains.length - 4) + '</span>' : '';
+      var sub = (row.symbol ? escapeHtml(row.symbol) + ' · ' : '') + escapeHtml(row.slug);
+      if (row.watchlist) sub += ' · <span class="tag watch">watchlist</span>';
+      if (row.variant) sub += ' · variant';
+      return '<tr data-rank="' + row.rank + '"' + (state.detailRank === row.rank ? ' class="selected"' : '') + '>' +
+        '<td class="num">' + row.rank + '</td>' +
+        '<td class="name">' + escapeHtml(row.name) + '<small>' + sub + '</small></td>' +
+        '<td>' + escapeHtml(row.category || '—') + '</td>' +
+        '<td>' + chainChips + extraChains + '</td>' +
+        '<td class="num">' + dollars(row.tvl) + '</td>' +
+        '<td class="num ' + changeClass + '">' + pct(row.change7d) + '</td>' +
+        '<td class="num">' + dollars(row.implied) + '</td>' +
+        '<td><span class="tag ' + row.confidence.toLowerCase() + '">' + row.confidence + '</span></td>' +
+        '<td><span class="tag ' + row.verdict.toLowerCase() + '">' + row.verdict + '</span></td>' +
+        '</tr>';
+    }).join('');
+    rowsEl.innerHTML = html;
+    document.querySelectorAll('th[data-sort]').forEach(function (th) {
+      th.classList.toggle('sorted', th.getAttribute('data-sort') === state.sortKey);
+      th.classList.toggle('sort-asc', th.getAttribute('data-sort') === state.sortKey && state.sortDir === 1);
+      th.classList.toggle('sort-desc', th.getAttribute('data-sort') === state.sortKey && state.sortDir === -1);
+    });
+  }
+
+  function renderDetail() {
+    if (!state.detailRank) {
+      detailEl.hidden = true;
+      detailEl.innerHTML = '';
+      return;
+    }
+    var row = null;
+    ROWS.forEach(function (candidate) {
+      if (candidate.rank === state.detailRank) row = candidate;
+    });
+    if (!row) {
+      detailEl.hidden = true;
+      detailEl.innerHTML = '';
+      return;
+    }
+    var evidenceLine = '';
+    if (row.tokenEvidence) {
+      evidenceLine = '<p class="sub">Token ' + escapeHtml(row.tokenEvidence.symbol) +
+        ' already trades (' + escapeHtml(row.tokenEvidence.name) + ', CoinGecko rank ' +
+        row.tokenEvidence.rank + ', market cap ' + dollars(row.tokenEvidence.market_cap) +
+        '). This row is capped at THIN and is not a pre-token bet.</p>';
+    } else {
+      evidenceLine = '<p class="sub">Records no token in the snapshot. ' +
+        (row.watchlist ? 'On the house watchlist. ' : '') +
+        'Implied value if its record stayed as it is.</p>';
+    }
+    detailEl.innerHTML =
+      '<button class="close" id="detail-close">Close ×</button>' +
+      '<h2>#' + row.rank + ' — ' + escapeHtml(row.name) + '</h2>' +
+      '<p class="sub">' + escapeHtml(row.category || 'Uncategorised') + ' · ' +
+      row.chains.map(escapeHtml).join(', ') + ' · ' +
+      '<span class="tag ' + row.verdict.toLowerCase() + '">' + row.verdict + '</span> ' +
+      '<span class="tag ' + row.confidence.toLowerCase() + '">' + row.confidence + ' confidence</span>' +
+      (row.variant ? ' <span class="tag watch">versioned variant</span>' : '') + '</p>' +
+      evidenceLine +
+      '<div class="facts">' +
+      '<div class="fact"><b>' + dollarsFull(row.implied) + '</b><span>implied value</span><small>TVL × multiple × growth × maturity × breadth</small></div>' +
+      '<div class="fact"><b>' + dollarsFull(row.tvl) + '</b><span>TVL</span><small>' + pct(row.change7d) + ' over 7 days</small></div>' +
+      '<div class="fact"><b>' + row.multiple.toFixed(3) + '×</b><span>multiple</span><small>TVL → market cap, from same-category comps</small></div>' +
+      '<div class="fact"><b>' + row.growth.toFixed(3) + '×</b><span>growth</span><small>from the 7-day TVL change</small></div>' +
+      '<div class="fact"><b>' + row.maturity.toFixed(3) + '×</b><span>maturity</span><small>age since first tracked</small></div>' +
+      '<div class="fact"><b>' + row.breadth.toFixed(3) + '×</b><span>breadth</span><small>' + row.chains.length + ' chain' + (row.chains.length === 1 ? '' : 's') + '</small></div>' +
+      '</div>' +
+      '<h3>Risks</h3><ul>' +
+      row.risks.map(function (risk) { return '<li>' + escapeHtml(risk) + '</li>'; }).join('') +
+      '</ul>' +
+      '<h3>How to farm it</h3><ol>' +
+      row.farm_steps.map(function (step) { return '<li>' + escapeHtml(step) + '</li>'; }).join('') +
+      '</ol>';
+    detailEl.hidden = false;
+    $('detail-close').addEventListener('click', function () {
+      state.detailRank = null;
+      renderDetail();
+      renderTable();
+    });
+    detailEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  function refresh() {
+    renderTable();
+    renderDetail();
+  }
+
+  // Events.
+  searchInput.addEventListener('input', function () {
+    state.q = searchInput.value;
+    renderTable();
+  });
+  verdictChips.addEventListener('click', function (event) {
+    var button = event.target.closest('button[data-verdict]');
+    if (!button) return;
+    state.verdict = button.getAttribute('data-verdict');
+    verdictChips.querySelectorAll('.chip').forEach(function (chip) {
+      chip.classList.toggle('active', chip === button);
+    });
+    renderTable();
+  });
+  categoryFilter.addEventListener('change', function () {
+    state.category = categoryFilter.value;
+    renderTable();
+  });
+  chainFilter.addEventListener('change', function () {
+    state.chain = chainFilter.value;
+    renderTable();
+  });
+  document.querySelectorAll('th[data-sort]').forEach(function (th) {
+    th.addEventListener('click', function () {
+      var key = th.getAttribute('data-sort');
+      if (state.sortKey === key) {
+        state.sortDir = -state.sortDir;
+      } else {
+        state.sortKey = key;
+        state.sortDir = key === 'name' || key === 'category' ? 1 : -1;
+      }
+      renderTable();
+    });
+  });
+  rowsEl.addEventListener('click', function (event) {
+    var tr = event.target.closest('tr[data-rank]');
+    if (!tr) return;
+    var rank = parseInt(tr.getAttribute('data-rank'), 10);
+    state.detailRank = state.detailRank === rank ? null : rank;
+    refresh();
+  });
+
+  // Initial state from the query string (?verdict=FARM&cat=Lending etc.).
+  if (state.verdict) {
+    verdictChips.querySelectorAll('.chip').forEach(function (chip) {
+      chip.classList.toggle('active', chip.getAttribute('data-verdict') === state.verdict);
+    });
+  }
+
+  renderStats();
+  renderFilters();
+  refresh();
+})();

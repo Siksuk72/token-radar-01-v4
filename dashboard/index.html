@@ -1,36 +1,73 @@
-<!doctype html>
-<html lang="id">
+<!DOCTYPE html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Token Radar — pre-token launch board</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Token Radar ranks 460 pre-token DeFi protocols by the implied value of their eventual token, with a seven-step farm plan for every row.">
+<title>Token Radar — which pre-token protocol is worth farming next</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<header>
-  <h1>📡 TOKEN <b>RADAR</b> — pre-token launch board</h1>
+<header class="top">
+  <div class="brand">
+    <span class="pulse" aria-hidden="true"></span>
+    <div>
+      <h1>Token Radar</h1>
+      <p class="tagline">Which pre-token protocol is worth farming next — and what to do about it.</p>
+    </div>
+  </div>
   <div class="stats" id="stats"></div>
 </header>
-<div class="bar">
-  <input type="search" id="q" placeholder="Cari protocol / kategori / chain…" style="min-width:280px">
-  <span class="chip on" data-v="ALL">Semua</span>
-  <span class="chip" data-v="FARM" style="color:var(--farm)">FARM</span>
-  <span class="chip" data-v="THIN" style="color:var(--thin)">THIN</span>
-  <span class="chip" data-v="SKIP">SKIP</span>
-  <select id="cat"><option value="">Semua kategori</option></select>
-  <select id="chain"><option value="">Semua chain</option></select>
-  <span class="c" id="count"></span>
-</div>
-<table>
-  <thead><tr>
-    <th data-s="rank">#</th><th data-s="name">Protocol</th><th data-s="category">Kategori</th>
-    <th>Chains</th><th data-s="tvl">TVL</th><th data-s="change7d">7Δ</th>
-    <th data-s="implied">Implied value</th><th data-s="confidence">Conf</th><th data-s="verdict">Verdict</th>
-  </tr></thead>
-  <tbody id="tb"></tbody>
-</table>
-<aside id="detail"><span class="close" onclick="closeDetail()">✕</span><div id="dBody"></div></aside>
-<footer>Token Radar · dibuat untuk bounty token-radar-01 · data: snapshot segel ·
-model radar-v1 — tiap angka dijelaskan di detail view · offline total</footer>
+
+<main>
+  <noscript><p class="empty">Token Radar needs JavaScript: the board is rendered from <code>data.js</code> in your browser.</p></noscript>
+  <section class="controls" aria-label="Board controls">
+    <input id="search" type="search" placeholder="Search a protocol…" autocomplete="off">
+    <div class="chips" id="verdict-chips" role="group" aria-label="Filter by verdict">
+      <button data-verdict="" class="chip active">All</button>
+      <button data-verdict="FARM" class="chip farm">FARM</button>
+      <button data-verdict="THIN" class="chip thin">THIN</button>
+      <button data-verdict="SKIP" class="chip skip">SKIP</button>
+    </div>
+    <select id="category-filter" aria-label="Filter by category">
+      <option value="">All categories</option>
+    </select>
+    <select id="chain-filter" aria-label="Filter by chain">
+      <option value="">All chains</option>
+    </select>
+  </section>
+
+  <section id="detail" class="detail" hidden aria-live="polite"></section>
+
+  <p class="count" id="count"></p>
+
+  <table class="board">
+    <thead>
+      <tr>
+        <th data-sort="rank" class="num sorted">#</th>
+        <th data-sort="name">Protocol</th>
+        <th data-sort="category">Category</th>
+        <th>Chains</th>
+        <th data-sort="tvl" class="num">TVL</th>
+        <th data-sort="change7d" class="num">7d</th>
+        <th data-sort="implied" class="num">Implied value</th>
+        <th data-sort="confidence">Confidence</th>
+        <th data-sort="verdict">Verdict</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <p class="empty" id="empty" hidden>No protocol matches these filters.</p>
+</main>
+
+<footer>
+  <p>Implied values are this radar's own claim about what a protocol's token would be
+  worth if its record stayed as it is. They are not a prediction that a token will be
+  issued, or when. Data: DefiLlama snapshot, 2026-11-14; market evidence: CoinGecko,
+  2026-11-21. A protocol that records no token may still have one — check before you farm.</p>
+</footer>
+
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>
